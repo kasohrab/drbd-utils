@@ -778,7 +778,6 @@ static int check_and_rotate_log_file(int fd, char* const the_time, char* const n
 	int new_fd = fd;
 	get_current_log_file_suffix_time(new_time, MAX_TIME_STR_SIZE);
 	if (strcmp(the_time, new_time) != 0) {
-		timestamp();
 		snprintf(log_file_suffixed, max_log_file_size, SUFFIXED_LOG_FILE_FORMAT, base_log_file, new_time);
 		int new_fd = open_log_file_ignore_error(log_file_suffixed);
 		if (new_fd != -1 && new_fd != fd) {
@@ -787,7 +786,6 @@ static int check_and_rotate_log_file(int fd, char* const the_time, char* const n
 			if (redirect_output) {
 				redirect_outputs(fd);
 			}
-			timestamp();
 			snprintf(the_time, MAX_TIME_STR_SIZE, "%s", new_time);
 		} 
 	}
