@@ -55,9 +55,11 @@ void usage_and_exit(void)
 	fprintf(stderr, "		(You cannot use it as backing device after doing that)\n");
 	fprintf(stderr, "	windrbd [opt] filesystem-state <drive-letter>\n");
 	fprintf(stderr, "		Shows the current filesystem state (windows, windrbd, other)\n");
-	fprintf(stderr, "	windrbd [opt] log-server [<log-file>] [<enable-hourly-log-rotation>]\n");
+	fprintf(stderr, "	windrbd [opt] log-server [<log-file>] [<hourly-log-rotation-frequency>]\n");
 	fprintf(stderr, "		Logs windrbd kernel messages to stdout (and optionally instead to\n");
-	fprintf(stderr, "		log-file). To enable hourly log-file rotation, set it equal to a non-zero uint.\n");
+	fprintf(stderr, "		log-file).\n");
+	fprintf(stderr, "		Optionally can instead log to log-file and set hourly log rotation frequency \n");
+	fprintf(stderr, "		to control the number of hours between log rotation (default 0 means no log rotation).\n");
 	fprintf(stderr, "	windrbd [opt] add-drive-in-explorer <drive-letter>\n");
 	fprintf(stderr, "		Tells Windows Explorer that drive has been created.\n");
 	fprintf(stderr, "	windrbd [opt] remove-drive-in-explorer <drive-letter>\n");
@@ -67,11 +69,12 @@ void usage_and_exit(void)
 	fprintf(stderr, "		fault injection if n is negative. Where is anything out of\n");
 	fprintf(stderr, "		[all|backing|meta]-[request|completion]. Drive must be\n");
 	fprintf(stderr, "		specified unless all is given.\n");
-	fprintf(stderr, "	windrbd [opt] user-mode-helper-daemon [<log-file>] [<enable-hourly-log-rotation>]\n");
+	fprintf(stderr, "	windrbd [opt] user-mode-helper-daemon [<log-file>] [<hourly-log-rotation-frequency>]\n");
 	fprintf(stderr, "		Run user mode helper daemon. Receives commands from\n");
 	fprintf(stderr, "		kernel driver if something interresting happens, runs\n");
 	fprintf(stderr, "		them and returns result to kernel.\n");
-	fprintf(stderr, "		Optionally can instead log to log-file and enable hourly log-file rotation by setting the flag to a non-zero uint.\n");
+	fprintf(stderr, "		Optionally can instead log to log-file and set hourly log rotation frequency \n");
+	fprintf(stderr, "		to control the number of hours between log rotation (default 0 means no log rotation).\n");
 	fprintf(stderr, "	windrbd [opt] set-mount-point-for-minor <minor> <mount-point>\n");
 	fprintf(stderr, "		Assign mountpoint (drive letter) to DRBD minor.\n");
 	fprintf(stderr, "	windrbd [opt] print-exe-path\n");
@@ -132,8 +135,11 @@ void usage_and_exit(void)
 }
 
 #define MAX_TIME_STR_SIZE 80
+#define DATE_HOUR_FORMAT "%Y-%m-%d-%H"
+#define TIMESTAMP_FORMAT "%Y-%m-%d %H:%M:%S"
+#define SECONDS_IN_HOUR 3600
 
-void get_current_time_as_str(char* const the_time, unsigned int size, struct timeval* const tv, const char* const format) {
+void get_current_time_as_str(char *const the_time, unsigned int size, struct timeval *const tv, const char* const format) {
 	struct tm nowtm;
 	time_t nowtime;
 
@@ -147,13 +153,14 @@ void timestamp(void)
 {
 	char the_time[MAX_TIME_STR_SIZE];
 	struct timeval tv;
-	get_current_time_as_str(the_time, MAX_TIME_STR_SIZE, &tv, "%Y-%m-%d %H:%M:%S");
+	get_current_time_as_str(the_time, MAX_TIME_STR_SIZE, &tv, TIMESTAMP_FORMAT);
 	printf("%s.%06ld ", the_time, tv.tv_usec);
 }
 
-void get_current_log_file_suffix_time(char* const the_time, unsigned int size) {
+long get_current_log_file_suffix_time(char *const the_time, unsigned int size) {
 	struct timeval tv;
-	get_current_time_as_str(the_time, size, &tv, "%Y-%m-%d-%H");
+	get_current_time_as_str(the_time, size, &tv, DATE_HOUR_FORMAT);
+	return tv.tv_sec / SECONDS_IN_HOUR;
 }
 
 	/* TODO: move those to user/shared/windrbd_helper.c */
@@ -766,18 +773,29 @@ int open_file_and_redirect_outputs(const char* const log_file) {
 #define MAX_LOG_FILE_SUFFIX_LENGTH 15 // enough bytes to represent hour level detail: .2025-12-12-10
 #define SUFFIXED_LOG_FILE_FORMAT "%s.%s"
 
-void prepare_log_file_suffixed(char* const the_time, char* const log_file_suffixed, size_t max_log_file_size, const char* log_file) {
-	get_current_log_file_suffix_time(the_time, MAX_TIME_STR_SIZE);
+long prepare_log_file_suffixed(char *const the_time, char *const log_file_suffixed, size_t max_log_file_size, const char *log_file) {
+	long current_hour = get_current_log_file_suffix_time(the_time, MAX_TIME_STR_SIZE);
 	snprintf(log_file_suffixed, max_log_file_size, SUFFIXED_LOG_FILE_FORMAT, log_file, the_time);
+	return current_hour;
 }
 
 #define REDIRECT_OUTPUT true
 #define NO_REDIRECT_OUTPUT false 
 
-static int check_and_rotate_log_file(int fd, char* const the_time, char* const new_time, char* const log_file_suffixed, size_t max_log_file_size, const char* const base_log_file, bool redirect_output) {
+static int check_and_rotate_log_file(
+	int fd, 
+	char *const the_time, 
+	char *const new_time, 
+	long *const active_log_file_hour_ptr /*updated if rotated log file*/, 
+	unsigned int hourly_log_rotation_frequency, 
+	char *const log_file_suffixed, 
+	size_t max_log_file_size, 
+	const char* const base_log_file, 
+	bool redirect_output) {
 	int new_fd = fd;
-	get_current_log_file_suffix_time(new_time, MAX_TIME_STR_SIZE);
-	if (strcmp(the_time, new_time) != 0) {
+	long new_hour = get_current_log_file_suffix_time(new_time, MAX_TIME_STR_SIZE);
+    long num_hours_elapsed = new_hour - *active_log_file_hour_ptr;
+	if (num_hours_elapsed >= hourly_log_rotation_frequency) {
 		snprintf(log_file_suffixed, max_log_file_size, SUFFIXED_LOG_FILE_FORMAT, base_log_file, new_time);
 		int new_fd = open_log_file_ignore_error(log_file_suffixed);
 		if (new_fd != -1 && new_fd != fd) {
@@ -787,12 +805,13 @@ static int check_and_rotate_log_file(int fd, char* const the_time, char* const n
 				redirect_outputs(fd);
 			}
 			snprintf(the_time, MAX_TIME_STR_SIZE, "%s", new_time);
+			*active_log_file_hour_ptr = new_hour;
 		} 
 	}
 	return new_fd;
 }
 
-int log_server_op(const char *log_file, bool hourly_log_rotation)
+int log_server_op(const char *log_file, unsigned int hourly_log_rotation_frequency)
 {
 	int s = socket(AF_INET, SOCK_DGRAM, 0);
 	if (s < 0) {
@@ -809,18 +828,22 @@ int log_server_op(const char *log_file, bool hourly_log_rotation)
 		return 1;
 	}
 
-	size_t max_log_file_size = strlen(log_file) + MAX_LOG_FILE_SUFFIX_LENGTH;
-	char log_file_suffixed[max_log_file_size];
+	int fd = -1;
+	size_t max_log_file_size = 0;
+	if (log_file != NULL) {
+    	max_log_file_size = strlen(log_file) + MAX_LOG_FILE_SUFFIX_LENGTH;
+	}
 	char the_time[MAX_TIME_STR_SIZE];
 	char new_time[MAX_TIME_STR_SIZE];
-	const char* initial_log_file = log_file;
-	
-	if (initial_log_file != NULL && hourly_log_rotation) {
-		prepare_log_file_suffixed(the_time, log_file_suffixed, max_log_file_size, log_file);
+	char log_file_suffixed[max_log_file_size];
+	const char *initial_log_file = log_file;
+	long active_log_file_hour;
+
+	if (initial_log_file != NULL && hourly_log_rotation_frequency) {
+		active_log_file_hour = prepare_log_file_suffixed(the_time, log_file_suffixed, max_log_file_size, log_file);
 		initial_log_file = log_file_suffixed;
 	}
-
-	int fd = -1;
+	
 	if (initial_log_file != NULL) {
 		fd = open_file_and_redirect_outputs(initial_log_file);
 	}
@@ -839,6 +862,7 @@ int log_server_op(const char *log_file, bool hourly_log_rotation)
 		if (len < 0) {
 			perror("recv");
 			fprintf(stderr, "Could not receive logging packet, retrying again in 1 second\n");
+			fflush(NULL);
 			sleep(1);
 			continue;
 		}
@@ -847,8 +871,8 @@ int log_server_op(const char *log_file, bool hourly_log_rotation)
 
 		buf[len] = '\0';
 		doslen = unix_to_dos(buf, len, dosbuf, sizeof(dosbuf), NULL);
-		if (fd >= 0 && hourly_log_rotation) {
-			fd = check_and_rotate_log_file(fd, the_time, new_time, log_file_suffixed, max_log_file_size, log_file, REDIRECT_OUTPUT);
+		if (fd >= 0 && hourly_log_rotation_frequency) {
+			fd = check_and_rotate_log_file(fd, the_time, new_time, &active_log_file_hour, hourly_log_rotation_frequency, log_file_suffixed, max_log_file_size, log_file, REDIRECT_OUTPUT);
 		}
 
 		if (write(1, dosbuf, doslen) < 0)
@@ -1297,7 +1321,7 @@ static int set_um_helper(void)
 
 #endif
 
-static int user_mode_helper_daemon(const char *log_file, bool hourly_log_rotation)
+static int user_mode_helper_daemon(const char *log_file, unsigned int hourly_log_rotation_frequency)
 {
 	struct windrbd_usermode_helper get_size;
 	struct windrbd_usermode_helper *next_cmd;
@@ -1306,14 +1330,18 @@ static int user_mode_helper_daemon(const char *log_file, bool hourly_log_rotatio
 	BOOL ret;
 
 	int fd = -1;
-	size_t max_log_file_size = strlen(log_file) + MAX_LOG_FILE_SUFFIX_LENGTH;
-	char log_file_suffixed[max_log_file_size];
+	size_t max_log_file_size = 0;
+	if (log_file != NULL) {
+    	max_log_file_size = strlen(log_file) + MAX_LOG_FILE_SUFFIX_LENGTH;
+	}
 	char the_time[MAX_TIME_STR_SIZE];
 	char new_time[MAX_TIME_STR_SIZE];
-	const char* initial_log_file = log_file;
+	char log_file_suffixed[max_log_file_size];
+	const char *initial_log_file = log_file;
+	long active_log_file_hour;
 
-	if (initial_log_file != NULL && hourly_log_rotation) {
-		prepare_log_file_suffixed(the_time, log_file_suffixed, max_log_file_size, log_file);
+	if (initial_log_file != NULL && hourly_log_rotation_frequency) {
+		active_log_file_hour = prepare_log_file_suffixed(the_time, log_file_suffixed, max_log_file_size, log_file);
 		initial_log_file = log_file_suffixed;
 	}
 
@@ -1351,14 +1379,15 @@ static int user_mode_helper_daemon(const char *log_file, bool hourly_log_rotatio
 	if (!quiet) {
 		timestamp();
 		printf("Connected to WinDRBD kernel driver\r\n");
+		fflush(NULL);
 	}
 
 /* Later: */
 /*	set_um_helper(); */
 
 	while (1) {
-		if (hourly_log_rotation) {
-			fd = check_and_rotate_log_file(fd, the_time, new_time, log_file_suffixed, max_log_file_size, log_file, REDIRECT_OUTPUT);
+		if (hourly_log_rotation_frequency) {
+			fd = check_and_rotate_log_file(fd, the_time, new_time, &active_log_file_hour, hourly_log_rotation_frequency, log_file_suffixed, max_log_file_size, log_file, REDIRECT_OUTPUT);
 		}
 		ret = DeviceIoControl(um_root_dev_handle, IOCTL_WINDRBD_ROOT_RECEIVE_USERMODE_HELPER, NULL, 0, &get_size, sizeof(get_size), &size, NULL);
 		if (!ret) {
@@ -1994,11 +2023,11 @@ int main(int argc, char ** argv)
 		}
 
 		const char *log_file = argv[optind+1];
-		bool hourly_log_rotation = false;
+		unsigned int hourly_log_rotation_frequency = 0;
 		if (argc == optind + 3) {
-			hourly_log_rotation = atoll_or_die(argv[optind+2]);
+			hourly_log_rotation_frequency = atoll_or_die(argv[optind+2]);
 		}
-		return log_server_op(log_file, hourly_log_rotation);
+		return log_server_op(log_file, hourly_log_rotation_frequency);
 	}
 	if (strcmp(op, "add-drive-in-explorer") == 0) {
 		if (argc != optind+2) {
@@ -2036,11 +2065,11 @@ int main(int argc, char ** argv)
 		}
 
 		const char *log_file = argv[optind+1];
-		bool hourly_log_rotation = false;
+		unsigned int hourly_log_rotation_frequency = 0;
 		if (argc == optind + 3) {
-			hourly_log_rotation = atoll_or_die(argv[optind+2]);
+			hourly_log_rotation_frequency = atoll_or_die(argv[optind+2]);
 		}
-		return user_mode_helper_daemon(log_file, hourly_log_rotation);
+		return user_mode_helper_daemon(log_file, hourly_log_rotation_frequency);
 	}
 	if (strcmp(op, "set-mount-point-for-minor") == 0) {
 		if (argc != optind+2 && argc != optind+3) {
